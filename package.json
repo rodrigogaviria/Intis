@@ -1,0 +1,5 @@
+{
+  "name": "intis",
+  "private": true,
+  "workspaces": ["backend", "frontend", "infra"]
+}
