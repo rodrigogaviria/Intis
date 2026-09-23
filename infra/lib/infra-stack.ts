@@ -1,16 +1,263 @@
-import * as cdk from 'aws-cdk-lib/core';
-import { Construct } from 'constructs';
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as path from "node:path";
+import * as fs from "node:fs";
+import { Stack, StackProps, Duration, RemovalPolicy, CfnOutput } from "aws-cdk-lib";
+import { Construct } from "constructs";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as rds from "aws-cdk-lib/aws-rds";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
+import * as s3 from "aws-cdk-lib/aws-s3";
+import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
+import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
+import * as route53 from "aws-cdk-lib/aws-route53";
+import * as targets from "aws-cdk-lib/aws-route53-targets";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import { CorsHttpMethod, HttpApi, HttpMethod } from "aws-cdk-lib/aws-apigatewayv2";
+import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 
-export class InfraStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+const REPO_ROOT = path.join(__dirname, "..", "..");
+const BACKEND = path.join(REPO_ROOT, "backend");
+const FRONTEND_DIST = path.join(REPO_ROOT, "frontend", "dist");
+const ROOT_LOCK = path.join(REPO_ROOT, "package-lock.json");
+
+/**
+ * MySQL 8.4 y no 8.0: RDS for MySQL 8.0 salio de soporte estandar el
+ * 31/07/2026 y desde el 01/08/2026 toda instancia 8.0 paga Extended Support
+ * automatico (~USD 146/mes extra en una t4g.micro). 8.4 tiene soporte
+ * estandar en RDS hasta el 31/07/2029. Version exacta: debe existir en RDS.
+ */
+const MYSQL_VERSION = "8.4.11";
+
+export interface InfraStackProps extends StackProps {
+  /**
+   * Dominio y zona son opcionales a proposito.
+   *
+   * Sin ellos el stack despliega VPC, RDS, Lambdas y API Gateway y omite
+   * certificado, CloudFront y registros DNS. Al pasarlos despues, CDK agrega
+   * el frente sin recrear la base ni la API.
+   */
+  appDomain?: string;
+  zone?: route53.IHostedZone;
+}
+
+export class InfraStack extends Stack {
+  constructor(scope: Construct, id: string, props: InfraStackProps) {
     super(scope, id, props);
 
-    // The code that defines your stack goes here
+    const { appDomain, zone } = props;
+    const conDominio = appDomain !== undefined && zone !== undefined;
 
-    // example resource
-    // const queue = new sqs.Queue(this, 'InfraQueue', {
-    //   visibilityTimeout: cdk.Duration.seconds(300)
-    // });
+    // VPC sin NAT Gateway — mismo patron de FRUBA y Yalqui
+    const vpc = new ec2.Vpc(this, "Vpc", {
+      maxAzs: 2,
+      natGateways: 0,
+      subnetConfiguration: [
+        { name: "isolated", subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 24 },
+      ],
+    });
+    vpc.addGatewayEndpoint("S3Endpoint", {
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+    });
+
+    // RDS MySQL
+    const db = new rds.DatabaseInstance(this, "Database", {
+      engine: rds.DatabaseInstanceEngine.mysql({
+        version: rds.MysqlEngineVersion.of(MYSQL_VERSION, "8.4"),
+      }),
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE4_GRAVITON, ec2.InstanceSize.MICRO),
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      multiAz: false,
+      allocatedStorage: 20,
+      storageType: rds.StorageType.GP3,
+      storageEncrypted: true,
+      databaseName: "intis",
+      credentials: rds.Credentials.fromGeneratedSecret("intis_admin"),
+      backupRetention: Duration.days(7),
+      deletionProtection: false, // TODO: true antes de produccion real
+      removalPolicy: RemovalPolicy.SNAPSHOT,
+      publiclyAccessible: false,
+    });
+
+    const jwtSecret = new secretsmanager.Secret(this, "JwtSecret", {
+      description: "Intis — secreto de firma de JWT",
+      generateSecretString: { passwordLength: 48, excludePunctuation: true },
+    });
+
+    const dbEnv: Record<string, string> = {
+      DB_HOST: db.dbInstanceEndpointAddress,
+      DB_PORT: db.dbInstanceEndpointPort,
+      DB_NAME: "intis",
+      // Una t4g.micro admite ~85 conexiones y cada contenedor de la Lambda abre
+      // hasta este numero. Sin concurrencia reservada, el techo lo pone el
+      // limite de la cuenta: con 10 concurrentes son 20 conexiones, holgado.
+      // Si se sube la cuota de concurrencia de la cuenta, revisar este valor.
+      DB_POOL_LIMIT: "2",
+      DB_USER: db.secret!.secretValueFromJson("username").unsafeUnwrap(),
+      DB_PASSWORD: db.secret!.secretValueFromJson("password").unsafeUnwrap(),
+      NODE_ENV: "production",
+    };
+
+    const bundling: nodejs.BundlingOptions = {
+      format: nodejs.OutputFormat.CJS,
+      target: "node24",
+      nodeModules: ["mysql2"],
+    };
+
+    // Lambda API (handler.ts con tRPC)
+    const apiFn = new nodejs.NodejsFunction(this, "ApiFn", {
+      entry: path.join(BACKEND, "src", "handler.ts"),
+      handler: "handler",
+      runtime: lambda.Runtime.NODEJS_24_X,
+      architecture: lambda.Architecture.ARM_64,
+      memorySize: 512,
+      timeout: Duration.seconds(20),
+      // Sin concurrencia reservada: la cuenta (compartida con otros proyectos)
+      // tiene un total de 10 y AWS exige dejar 10 sin reservar.
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      depsLockFilePath: ROOT_LOCK,
+      bundling,
+      environment: {
+        ...dbEnv,
+        JWT_SECRET: jwtSecret.secretValue.unsafeUnwrap(),
+        JWT_EXPIRES_IN: "7d",
+        ...(conDominio ? { CORS_ORIGIN: `https://${appDomain}` } : {}),
+      },
+    });
+    db.connections.allowDefaultPortFrom(apiFn, "Lambda API a MySQL");
+
+    const initFn = new nodejs.NodejsFunction(this, "InitDbFn", {
+      functionName: "intis-init-db",
+      entry: path.join(BACKEND, "src", "db", "init-handler.ts"),
+      handler: "handler",
+      runtime: lambda.Runtime.NODEJS_24_X,
+      architecture: lambda.Architecture.ARM_64,
+      memorySize: 512,
+      timeout: Duration.minutes(3),
+      vpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      depsLockFilePath: ROOT_LOCK,
+      bundling: { ...bundling, loader: { ".sql": "text" } },
+      environment: dbEnv,
+    });
+    db.connections.allowDefaultPortFrom(initFn, "Lambda init a MySQL");
+
+    // API Gateway v2 (HttpApi)
+    const httpApi = new HttpApi(this, "HttpApi", {
+      defaultIntegration: new HttpLambdaIntegration("ApiIntegration", apiFn),
+      corsPreflight: {
+        allowOrigins: conDominio ? [`https://${appDomain}`] : ["http://localhost:5173"],
+        allowMethods: [CorsHttpMethod.GET, CorsHttpMethod.POST, CorsHttpMethod.OPTIONS],
+        allowHeaders: ["content-type", "authorization"],
+        maxAge: Duration.hours(1),
+      },
+    });
+    // Ruta explicita /trpc/{proxy+}: sin ella el adaptador de tRPC toma la ruta
+    // completa "trpc/salud" como nombre del procedimiento y responde 404.
+    httpApi.addRoutes({
+      path: "/trpc/{proxy+}",
+      methods: [HttpMethod.ANY],
+      integration: new HttpLambdaIntegration("TrpcIntegration", apiFn),
+    });
+
+    const apiDomain = `${httpApi.httpApiId}.execute-api.${this.region}.amazonaws.com`;
+
+    const siteBucket = new s3.Bucket(this, "SiteBucket", {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+
+    // Bucket de uploads — archivos que suba la aplicacion
+    const uploadsBucket = new s3.Bucket(this, "UploadsBucket", {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    uploadsBucket.grantPut(apiFn);
+    apiFn.addEnvironment("UPLOADS_BUCKET", uploadsBucket.bucketName);
+
+    if (conDominio) {
+      const recordName = appDomain!.endsWith(`.${zone!.zoneName}`)
+        ? appDomain!.slice(0, appDomain!.length - zone!.zoneName.length - 1)
+        : appDomain!;
+
+      const certificate = new acm.Certificate(this, "Certificate", {
+        domainName: appDomain,
+        validation: acm.CertificateValidation.fromDns(zone),
+      });
+
+      const spaRewrite = new cloudfront.Function(this, "SpaRewrite", {
+        code: cloudfront.FunctionCode.fromInline(
+          [
+            "function handler(event) {",
+            "  var request = event.request;",
+            "  var uri = request.uri;",
+            "  if (uri.endsWith('/')) { request.uri = '/index.html'; }",
+            "  else if (!uri.includes('.')) { request.uri = '/index.html'; }",
+            "  return request;",
+            "}",
+          ].join("\n")
+        ),
+      });
+
+      const apiBehavior: cloudfront.BehaviorOptions = {
+        origin: new origins.HttpOrigin(apiDomain),
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+        originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+      };
+
+      const distribution = new cloudfront.Distribution(this, "Distribution", {
+        domainNames: [appDomain],
+        certificate,
+        defaultRootObject: "index.html",
+        priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
+        defaultBehavior: {
+          origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket),
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          functionAssociations: [{ function: spaRewrite, eventType: cloudfront.FunctionEventType.VIEWER_REQUEST }],
+        },
+        additionalBehaviors: {
+          "/trpc/*": apiBehavior,
+          "/health": apiBehavior,
+          "/uploads/*": {
+            origin: origins.S3BucketOrigin.withOriginAccessControl(uploadsBucket),
+            viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          },
+        },
+      });
+
+      const distExists = fs.existsSync(path.join(FRONTEND_DIST, "index.html"));
+      new s3deploy.BucketDeployment(this, "DeploySite", {
+        sources: distExists
+          ? [s3deploy.Source.asset(FRONTEND_DIST)]
+          : [s3deploy.Source.data("index.html", "<!doctype html><title>Intis</title><h1>Desplegando…</h1>")],
+        destinationBucket: siteBucket,
+        distribution,
+        distributionPaths: ["/*"],
+        // Bug conocido de CDK/CloudFront (aws-cdk #15891)
+        waitForDistributionInvalidation: false,
+      });
+
+      const cfTarget = route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(distribution));
+      new route53.ARecord(this, "AliasApp", { zone: zone!, recordName, target: cfTarget });
+      new route53.AaaaRecord(this, "AliasAppV6", { zone: zone!, recordName, target: cfTarget });
+
+      new CfnOutput(this, "SiteUrl", { value: `https://${appDomain}` });
+      new CfnOutput(this, "CloudFrontDomain", { value: distribution.distributionDomainName });
+    }
+
+    new CfnOutput(this, "ApiEndpoint", { value: httpApi.apiEndpoint });
+    new CfnOutput(this, "DbEndpoint", { value: db.dbInstanceEndpointAddress });
+    new CfnOutput(this, "DbSecretName", { value: db.secret!.secretName });
+    new CfnOutput(this, "InitDbFunctionName", { value: initFn.functionName });
   }
 }

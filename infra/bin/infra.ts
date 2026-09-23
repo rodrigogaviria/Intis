@@ -1,20 +1,35 @@
-#!/usr/bin/env node
-import * as cdk from 'aws-cdk-lib/core';
-import { InfraStack } from '../lib/infra-stack';
+import * as cdk from "aws-cdk-lib";
+import { IntisDnsStack } from "../lib/dns-stack";
+import { InfraStack } from "../lib/infra-stack";
 
 const app = new cdk.App();
-new InfraStack(app, 'InfraStack', {
-  /* If you don't specify 'env', this stack will be environment-agnostic.
-   * Account/Region-dependent features and context lookups will not work,
-   * but a single synthesized template can be deployed anywhere. */
 
-  /* Uncomment the next line to specialize this stack for the AWS Account
-   * and Region that are implied by the current CLI configuration. */
-  // env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: process.env.CDK_DEFAULT_REGION },
+const env = { account: process.env.CDK_DEFAULT_ACCOUNT, region: "us-east-1" };
 
-  /* Uncomment the next line if you know exactly what Account and Region you
-   * want to deploy the stack to. */
-  // env: { account: '123456789012', region: 'us-east-1' },
+/**
+ * Dominio: una sola constante para los dos stacks.
+ *
+ * NO cambiar una vez desplegado: cambiar el nombre obliga a CloudFormation a
+ * reemplazar la zona (otros 4 nameservers) y el dominio deja de resolver.
+ * Es lo que le paso a Yalqui el 1 de septiembre. Protecciones: la zona tiene
+ * RemovalPolicy.RETAIN y IntisDnsStack tiene terminationProtection.
+ */
+const DOMINIO = "intis.com";
+const APP_DOMAIN = `app.${DOMINIO}`;
 
-  /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */
+const dns = new IntisDnsStack(app, "IntisDnsStack", {
+  env,
+  domainName: DOMINIO,
+  terminationProtection: true,
+});
+
+/**
+ * El dominio no va detras de una bandera: el despliegue automatico corre
+ * `cdk deploy --all` sin contexto extra, y cualquier condicion que dependa
+ * de `-c` borraria certificado, CloudFront y DNS en el siguiente push.
+ */
+new InfraStack(app, "IntisStack", {
+  env,
+  appDomain: APP_DOMAIN,
+  zone: dns.zone,
 });
