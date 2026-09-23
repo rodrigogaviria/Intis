@@ -90,7 +90,7 @@ async function migrar(soloVerificar: boolean): Promise<ResultadoMigracion[]> {
 }
 
 export interface EventoInit {
-  mode?: "migrate" | "status" | "seed";
+  mode?: "migrate" | "status" | "seed" | "promote" | "delete-user";
   /** Para `promote` y `delete-user`: a qué cuenta aplica. */
   email?: string;
   /** Para `promote`: qué rol otorgar. Hoy solo tiene sentido admin_intis — es
@@ -107,12 +107,17 @@ export async function handler(event: EventoInit = {}) {
     return { mode, migraciones: await migrar(true) };
   }
   if (mode === "seed") {
-    // Los catálogos que el sistema necesita para funcionar —planes,
-    // características, ajustes del canon y la regla de precalificación— van
-    // dentro de las migraciones, no acá: sin ellos no se puede crear una
-    // suscripción ni armar un canon, así que no son datos opcionales.
+    // Los catálogos que el sistema necesita para funcionar van dentro de las
+    // migraciones, no acá: no son datos opcionales.
     // Este modo queda para datos de demostración, que todavía no existen.
     return { mode, resultado: "PENDIENTE_DE_DEFINIR — sin datos de demostración" };
+  }
+
+  if (mode === "promote") {
+    return promover(event.email, event.rol ?? "admin_intis");
+  }
+  if (mode === "delete-user") {
+    return borrarUsuario(event.email);
   }
 
   const migraciones = await migrar(false);
@@ -124,4 +129,107 @@ export async function handler(event: EventoInit = {}) {
     conflictos: conflictos.map((c) => c.version),
     migraciones,
   };
+}
+
+/**
+ * Otorga un rol a una cuenta ya registrada. Pensado para el primer
+ * `admin_intis`: ese rol es el único con el que se pueden otorgar los demás
+ * desde la pantalla de administración, y sin uno ya en la base no hay forma de
+ * crear el siguiente por ahí. La cuenta tiene que existir — se registra por el
+ * flujo normal de registro, para que la contraseña quede cifrada igual que
+ * cualquier otra.
+ *
+ * Idempotente: otorgarlo dos veces no duplica la fila ni falla.
+ *
+ * PENDIENTE (modelo real de Intis): asume las mismas tablas y columnas que
+ * Yalqui (`usuarios`; `usuario_roles` con `ambito_tipo`, `ambito_id`,
+ * `revocado_at`, `otorgado_at`). Ajustar si el esquema de Intis cambia.
+ * Mientras esas tablas no existan, este modo falla con "table doesn't exist".
+ */
+async function promover(email: string | undefined, rol: string) {
+  if (!email) throw new Error("Falta el correo de la cuenta a promover");
+
+  const conn = await conectar();
+  try {
+    const [usuarios] = await conn.query<any[]>(
+      "SELECT id, nombre, apellido FROM usuarios WHERE email = ?",
+      [email],
+    );
+    const usuario = usuarios[0];
+    if (!usuario) {
+      throw new Error(`No existe ninguna cuenta con el correo ${email}. Registrala primero.`);
+    }
+
+    // El único rol global es admin_intis, y ambito_id va en 0 por convención:
+    // no hay «sobre qué» cuando el alcance es todo el sistema.
+    await conn.execute(
+      `INSERT INTO usuario_roles (usuario_id, rol, ambito_tipo, ambito_id)
+       VALUES (?, ?, 'global', 0)
+       ON DUPLICATE KEY UPDATE revocado_at = NULL, otorgado_at = CURRENT_TIMESTAMP`,
+      [usuario.id, rol],
+    );
+
+    return { mode: "promote", email, usuarioId: usuario.id, rol, ok: true };
+  } finally {
+    await conn.end();
+  }
+}
+
+/**
+ * Borra una cuenta, pero solo si no tiene nada colgando de ella.
+ *
+ * Existe para limpiar cuentas de prueba — como la que se usa para verificar
+ * que el registro funciona después de un despliegue — sin arriesgarse a
+ * romper una referencia real. Si la cuenta tiene datos en alguna tabla de
+ * `revisiones`, se niega en vez de intentar arrastrar el borrado.
+ *
+ * PENDIENTE (modelo real de Intis): la versión de Yalqui revisaba tablas del
+ * negocio inmobiliario (inmuebles, contratos, aplicaciones, visitas) y borraba
+ * también `consentimientos`. Acá solo queda lo genérico. Cuando exista el
+ * modelo de Intis:
+ *   1. Agregar a `revisiones` cada tabla de Intis que referencie a un usuario.
+ *   2. Si hay tablas dependientes que sí deben borrarse junto con la cuenta
+ *      (como `consentimientos` en Yalqui), borrarlas en la transacción final.
+ */
+async function borrarUsuario(email: string | undefined) {
+  if (!email) throw new Error("Falta el correo de la cuenta a borrar");
+
+  const conn = await conectar();
+  try {
+    const [usuarios] = await conn.query<any[]>("SELECT id FROM usuarios WHERE email = ?", [email]);
+    const usuario = usuarios[0];
+    if (!usuario) return { mode: "delete-user", email, ok: false, motivo: "No existe esa cuenta" };
+
+    const revisiones: Array<[string, string]> = [
+      ["usuario_roles", "usuario_id"],
+      // PENDIENTE: agregar aquí las tablas de Intis que referencien a un usuario.
+    ];
+
+    for (const [tabla, columna] of revisiones) {
+      const [filas] = await conn.query<any[]>(
+        `SELECT COUNT(*) AS n FROM ${tabla} WHERE ${columna} = ?`,
+        [usuario.id],
+      );
+      if (Number(filas[0].n) > 0) {
+        return {
+          mode: "delete-user", email, ok: false,
+          motivo: `Tiene ${filas[0].n} fila(s) en ${tabla}: no se borra una cuenta con datos reales`,
+        };
+      }
+    }
+
+    await conn.beginTransaction();
+    try {
+      // PENDIENTE: borrar aquí las tablas dependientes que deban irse con la cuenta.
+      await conn.execute("DELETE FROM usuarios WHERE id = ?", [usuario.id]);
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      throw e;
+    }
+
+    return { mode: "delete-user", email, usuarioId: usuario.id, ok: true };
+  } finally {
+    await conn.end();
+  }
 }
