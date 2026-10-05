@@ -28,7 +28,7 @@ const ROOT_LOCK = path.join(REPO_ROOT, "package-lock.json");
  * automatico (~USD 146/mes extra en una t4g.micro). 8.4 tiene soporte
  * estandar en RDS hasta el 31/07/2029. Version exacta: debe existir en RDS.
  */
-const MYSQL_VERSION = "8.4.11";
+const MYSQL_VERSION = "8.4.10";
 
 export interface InfraStackProps extends StackProps {
   /**
@@ -66,7 +66,9 @@ export class InfraStack extends Stack {
       engine: rds.DatabaseInstanceEngine.mysql({
         version: rds.MysqlEngineVersion.of(MYSQL_VERSION, "8.4"),
       }),
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE4_GRAVITON, ec2.InstanceSize.MICRO),
+            // t3.micro y no t4g.micro: RDS ya no ofrece db.t4g.micro para instancias
+      // nuevas de MySQL 8.4 (las existentes en la cuenta siguen funcionando).
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE3, ec2.InstanceSize.MICRO),
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
       multiAz: false,
